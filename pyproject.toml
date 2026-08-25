@@ -76,7 +76,9 @@ boltz-fix-macos-libomp = "boltz.scripts.fix_macos_libomp:main"
 
 [project.optional-dependencies]
 lint = ["ruff"]
-test = ["pytest", "requests"]
+# gemmi>=0.7.4 adds gemmi.read_structure_string, used only by the mmCIF writer
+# tests. The runtime floor above stays at >=0.6.5 because src/ never calls it.
+test = ["pytest", "requests", "gemmi>=0.7.4"]
 cuda = [
     "cuequivariance_ops_cu12>=0.5.0",
     "cuequivariance_ops_torch_cu12>=0.5.0",
