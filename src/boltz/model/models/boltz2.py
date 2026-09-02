@@ -620,12 +620,23 @@ class Boltz2(LightningModule):
             )
 
         if self.affinity_prediction:
+            batch_size = feats["token_pad_mask"].shape[0]
+            sample_atom_coords = dict_out["sample_atom_coords"].detach()
+            samples_per_record = sample_atom_coords.shape[0] // batch_size
+            coords_affinity = sample_atom_coords.reshape(
+                batch_size, samples_per_record, *sample_atom_coords.shape[1:]
+            )[:, :1]
+            s_inputs_affinity = self.input_embedder(feats, affinity=True)
+
             with torch.autocast(autocast_device_type(s.device.type), enabled=False):
                 if self.affinity_ensemble:
                     dict_out_affinity1 = self.affinity_module1(
+                        s_inputs=s_inputs_affinity.detach(),
                         z=z.detach(),
+                        x_pred=coords_affinity,
                         feats=feats,
                         multiplicity=1,
+                        use_kernels=self.use_kernels,
                     )
 
                     dict_out_affinity1["affinity_probability_binary"] = (
@@ -634,9 +645,12 @@ class Boltz2(LightningModule):
                         )
                     )
                     dict_out_affinity2 = self.affinity_module2(
+                        s_inputs=s_inputs_affinity.detach(),
                         z=z.detach(),
+                        x_pred=coords_affinity,
                         feats=feats,
                         multiplicity=1,
+                        use_kernels=self.use_kernels,
                     )
                     dict_out_affinity2["affinity_probability_binary"] = (
                         torch.nn.functional.sigmoid(
@@ -692,9 +706,12 @@ class Boltz2(LightningModule):
                     dict_out.update(dict_out_affinity2)
                 else:
                     dict_out_affinity = self.affinity_module(
+                        s_inputs=s_inputs_affinity.detach(),
                         z=z.detach(),
+                        x_pred=coords_affinity,
                         feats=feats,
                         multiplicity=1,
+                        use_kernels=self.use_kernels,
                     )
                     dict_out.update(
                         {
