@@ -1201,7 +1201,7 @@ def _parse_devices(value: str) -> Union[int, List[int]]:
     type=click.IntRange(min=1),
     help=(
         "The number of inputs to process per batch during Boltz-2 structure "
-        "prediction. Affinity prediction remains batch_size=1."
+        "and affinity prediction."
     ),
     default=1,
 )
@@ -1781,8 +1781,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
             msa_dir=processed.msa_dir,
             mol_dir=mol_dir,
             num_workers=num_workers,
-            # Keep affinity single-record until the batched affinity path is audited.
-            batch_size=1,
+            batch_size=batch_size,
             constraints_dir=processed.constraints_dir,
             template_dir=processed.template_dir,
             extra_mols_dir=processed.extra_mols_dir,

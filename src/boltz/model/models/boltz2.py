@@ -620,34 +620,12 @@ class Boltz2(LightningModule):
             )
 
         if self.affinity_prediction:
-            pad_token_mask = feats["token_pad_mask"][0]
-            rec_mask = feats["mol_type"][0] == 0
-            rec_mask = rec_mask * pad_token_mask
-            lig_mask = feats["affinity_token_mask"][0].to(torch.bool)
-            lig_mask = lig_mask * pad_token_mask
-            cross_pair_mask = (
-                lig_mask[:, None] * rec_mask[None, :]
-                + rec_mask[:, None] * lig_mask[None, :]
-                + lig_mask[:, None] * lig_mask[None, :]
-            )
-            z_affinity = z * cross_pair_mask[None, :, :, None]
-
-            argsort = torch.argsort(dict_out["iptm"], descending=True)
-            best_idx = argsort[0].item()
-            coords_affinity = dict_out["sample_atom_coords"].detach()[best_idx][
-                None, None
-            ]
-            s_inputs = self.input_embedder(feats, affinity=True)
-
             with torch.autocast(autocast_device_type(s.device.type), enabled=False):
                 if self.affinity_ensemble:
                     dict_out_affinity1 = self.affinity_module1(
-                        s_inputs=s_inputs.detach(),
-                        z=z_affinity.detach(),
-                        x_pred=coords_affinity,
+                        z=z.detach(),
                         feats=feats,
                         multiplicity=1,
-                        use_kernels=self.use_kernels,
                     )
 
                     dict_out_affinity1["affinity_probability_binary"] = (
@@ -656,12 +634,9 @@ class Boltz2(LightningModule):
                         )
                     )
                     dict_out_affinity2 = self.affinity_module2(
-                        s_inputs=s_inputs.detach(),
-                        z=z_affinity.detach(),
-                        x_pred=coords_affinity,
+                        z=z.detach(),
                         feats=feats,
                         multiplicity=1,
-                        use_kernels=self.use_kernels,
                     )
                     dict_out_affinity2["affinity_probability_binary"] = (
                         torch.nn.functional.sigmoid(
@@ -702,7 +677,9 @@ class Boltz2(LightningModule):
                         model_coef = 1.03525938
                         mw_coef = -0.59992683
                         bias = 2.83288489
-                        mw = feats["affinity_mw"][0] ** 0.3
+                        mw = torch.as_tensor(
+                            feats["affinity_mw"], device=z.device, dtype=z.dtype
+                        ).reshape(-1, 1) ** 0.3
                         dict_out_affinity_ensemble["affinity_pred_value"] = (
                             model_coef
                             * dict_out_affinity_ensemble["affinity_pred_value"]
@@ -715,12 +692,9 @@ class Boltz2(LightningModule):
                     dict_out.update(dict_out_affinity2)
                 else:
                     dict_out_affinity = self.affinity_module(
-                        s_inputs=s_inputs.detach(),
-                        z=z_affinity.detach(),
-                        x_pred=coords_affinity,
+                        z=z.detach(),
                         feats=feats,
                         multiplicity=1,
-                        use_kernels=self.use_kernels,
                     )
                     dict_out.update(
                         {

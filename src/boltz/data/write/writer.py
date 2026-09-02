@@ -404,39 +404,27 @@ class BoltzAffinityWriter(BasePredictionWriter):
         if prediction["exception"]:
             self.failed += 1
             return
-        record = batch["record"][0]
-        # Dump affinity summary
-        affinity_summary = {}
         pred_affinity_value = prediction["affinity_pred_value"]
         pred_affinity_probability = prediction["affinity_probability_binary"]
-        affinity_summary = {
-            "affinity_pred_value": pred_affinity_value.item(),
-            "affinity_probability_binary": pred_affinity_probability.item(),
-        }
-        if record.affinity and record.affinity.chain_name:
-            affinity_summary["binder_chain"] = record.affinity.chain_name
-        if "affinity_pred_value1" in prediction:
-            pred_affinity_value1 = prediction["affinity_pred_value1"]
-            pred_affinity_probability1 = prediction["affinity_probability_binary1"]
-            pred_affinity_value2 = prediction["affinity_pred_value2"]
-            pred_affinity_probability2 = prediction["affinity_probability_binary2"]
-            affinity_summary["affinity_pred_value1"] = pred_affinity_value1.item()
-            affinity_summary["affinity_probability_binary1"] = (
-                pred_affinity_probability1.item()
-            )
-            affinity_summary["affinity_pred_value2"] = pred_affinity_value2.item()
-            affinity_summary["affinity_probability_binary2"] = (
-                pred_affinity_probability2.item()
-            )
+        for index, record in enumerate(batch["record"]):
+            affinity_summary = {
+                "affinity_pred_value": pred_affinity_value[index].item(),
+                "affinity_probability_binary": pred_affinity_probability[index].item(),
+            }
+            if record.affinity and record.affinity.chain_name:
+                affinity_summary["binder_chain"] = record.affinity.chain_name
+            if "affinity_pred_value1" in prediction:
+                affinity_summary["affinity_pred_value1"] = prediction["affinity_pred_value1"][index].item()
+                affinity_summary["affinity_probability_binary1"] = prediction["affinity_probability_binary1"][index].item()
+                affinity_summary["affinity_pred_value2"] = prediction["affinity_pred_value2"][index].item()
+                affinity_summary["affinity_probability_binary2"] = prediction["affinity_probability_binary2"][index].item()
 
-        # Save the affinity summary
-        struct_dir = self.output_dir / record.id
-        struct_dir.mkdir(exist_ok=True)
-        output_id = get_affinity_output_id(record)
-        path = struct_dir / f"affinity_{output_id}.json"
-
-        with path.open("w") as f:
-            f.write(json.dumps(affinity_summary, indent=4))
+            struct_dir = self.output_dir / record.id
+            struct_dir.mkdir(exist_ok=True)
+            output_id = get_affinity_output_id(record)
+            path = struct_dir / f"affinity_{output_id}.json"
+            with path.open("w") as f:
+                f.write(json.dumps(affinity_summary, indent=4))
 
     def on_predict_epoch_end(
         self,

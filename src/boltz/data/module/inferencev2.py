@@ -351,8 +351,6 @@ class Boltz2InferenceDataModule(pl.LightningDataModule):
 
         """
         super().__init__()
-        if affinity and batch_size != 1:
-            raise ValueError("Affinity inference only supports batch_size=1.")
         self.num_workers = num_workers
         self.batch_size = batch_size
         self.manifest = manifest
