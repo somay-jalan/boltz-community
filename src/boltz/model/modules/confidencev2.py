@@ -17,15 +17,15 @@ from boltz.model.modules.trunkv2 import (
 from boltz.model.modules.utils import LinearNoBias
 
 
-def _concat_confidence_outputs(out_dicts):
-    """Concatenate sequential confidence outputs, preserving nested dicts."""
+def _stack_confidence_outputs(out_dicts):
+    """Interleave sequential samples per record, preserving nested dicts."""
     first = out_dicts[0]
     if isinstance(first, dict):
         return {
-            key: _concat_confidence_outputs([out[key] for out in out_dicts])
+            key: _stack_confidence_outputs([out[key] for out in out_dicts])
             for key in first
         }
-    return torch.cat(out_dicts, dim=0)
+    return torch.stack(out_dicts, dim=1).flatten(0, 1)
 
 
 class ConfidenceModule(nn.Module):
@@ -130,7 +130,9 @@ class ConfidenceModule(nn.Module):
         use_kernels: bool = False,
     ):
         if run_sequentially and multiplicity > 1:
-            assert z.shape[0] == 1, "Not supported with batch size > 1"
+            batch_size = z.shape[0]
+            if x_pred.ndim == 3:
+                x_pred = x_pred.reshape(batch_size, multiplicity, *x_pred.shape[1:])
             out_dicts = []
             for sample_idx in range(multiplicity):
                 out_dicts.append(  # noqa: PERF401
@@ -138,7 +140,7 @@ class ConfidenceModule(nn.Module):
                         s_inputs,
                         s,
                         z,
-                        x_pred[sample_idx : sample_idx + 1],
+                        x_pred[:, sample_idx : sample_idx + 1],
                         feats,
                         pred_distogram_logits,
                         multiplicity=1,
@@ -147,7 +149,7 @@ class ConfidenceModule(nn.Module):
                     )
                 )
 
-            return _concat_confidence_outputs(out_dicts)
+            return _stack_confidence_outputs(out_dicts)
 
         s_inputs = self.s_inputs_norm(s_inputs)
         if not self.no_update_s:

@@ -1828,10 +1828,6 @@ def predict(  # noqa: C901, PLR0915, PLR0912
             steering_args=asdict(steering_args),
             affinity_mw_correction=affinity_mw_correction,
         )
-        # Affinity scoring does not consume confidence outputs. Disable the
-        # confidence module for this pass because it only supports one record
-        # per batch, while the affinity head supports batched inputs.
-        model_module.confidence_prediction = False
         model_module.eval()
 
         trainer.callbacks[0] = pred_writer

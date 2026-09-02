@@ -623,9 +623,14 @@ class Boltz2(LightningModule):
             batch_size = feats["token_pad_mask"].shape[0]
             sample_atom_coords = dict_out["sample_atom_coords"].detach()
             samples_per_record = sample_atom_coords.shape[0] // batch_size
-            coords_affinity = sample_atom_coords.reshape(
+            sample_atom_coords = sample_atom_coords.reshape(
                 batch_size, samples_per_record, *sample_atom_coords.shape[1:]
-            )[:, :1]
+            )
+            iptm = dict_out["iptm"].reshape(batch_size, samples_per_record)
+            best_sample_idx = iptm.argmax(dim=1)
+            coords_affinity = sample_atom_coords[
+                torch.arange(batch_size, device=z.device), best_sample_idx
+            ].unsqueeze(1)
             s_inputs_affinity = self.input_embedder(feats, affinity=True)
 
             with torch.autocast(autocast_device_type(s.device.type), enabled=False):
