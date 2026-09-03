@@ -633,11 +633,21 @@ class Boltz2(LightningModule):
             ].unsqueeze(1)
             s_inputs_affinity = self.input_embedder(feats, affinity=True)
 
+            pad_token_mask = feats["token_pad_mask"]
+            rec_mask = (feats["mol_type"] == 0) * pad_token_mask
+            lig_mask = feats["affinity_token_mask"].to(torch.bool) * pad_token_mask
+            cross_pair_mask = (
+                lig_mask[:, :, None] * rec_mask[:, None, :]
+                + rec_mask[:, :, None] * lig_mask[:, None, :]
+                + lig_mask[:, :, None] * lig_mask[:, None, :]
+            )
+            z_affinity = z * cross_pair_mask[..., None]
+
             with torch.autocast(autocast_device_type(s.device.type), enabled=False):
                 if self.affinity_ensemble:
                     dict_out_affinity1 = self.affinity_module1(
                         s_inputs=s_inputs_affinity.detach(),
-                        z=z.detach(),
+                        z=z_affinity.detach(),
                         x_pred=coords_affinity,
                         feats=feats,
                         multiplicity=1,
@@ -651,7 +661,7 @@ class Boltz2(LightningModule):
                     )
                     dict_out_affinity2 = self.affinity_module2(
                         s_inputs=s_inputs_affinity.detach(),
-                        z=z.detach(),
+                        z=z_affinity.detach(),
                         x_pred=coords_affinity,
                         feats=feats,
                         multiplicity=1,
@@ -712,7 +722,7 @@ class Boltz2(LightningModule):
                 else:
                     dict_out_affinity = self.affinity_module(
                         s_inputs=s_inputs_affinity.detach(),
-                        z=z.detach(),
+                        z=z_affinity.detach(),
                         x_pred=coords_affinity,
                         feats=feats,
                         multiplicity=1,
