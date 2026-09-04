@@ -59,6 +59,38 @@ def _validate_prediction_leading_dim(
             raise ValueError(msg)
 
 
+def _unpad_plddt(
+    plddt: Tensor,
+    atom_mask: Tensor,
+    token_mask: Tensor | None,
+) -> Tensor:
+    """Crop token- or atom-level pLDDT using the matching padding mask."""
+    if token_mask is not None and plddt.shape[-1] == token_mask.numel():
+        return plddt[token_mask]
+    if plddt.shape[-1] == atom_mask.numel():
+        return plddt[atom_mask]
+    msg = (
+        f"Cannot match pLDDT length {plddt.shape[-1]} to token mask length "
+        f"{token_mask.numel() if token_mask is not None else 'unavailable'} or "
+        f"atom mask length {atom_mask.numel()}."
+    )
+    raise ValueError(msg)
+
+
+def _unpad_token_pair(value: Tensor, token_mask: Tensor | None) -> Tensor:
+    """Crop a token-pair prediction on both token axes."""
+    if token_mask is None:
+        return value
+    expected = (token_mask.numel(), token_mask.numel())
+    if value.shape[-2:] != expected:
+        msg = (
+            f"Cannot match pair prediction shape {tuple(value.shape[-2:])} "
+            f"to token mask shape {expected}."
+        )
+        raise ValueError(msg)
+    return value[token_mask][:, token_mask]
+
+
 class BoltzWriter(BasePredictionWriter):
     """Custom writer for predictions."""
 
@@ -113,6 +145,7 @@ class BoltzWriter(BasePredictionWriter):
         # in record-major order.
         coords = prediction["coords"]
         pad_masks = prediction["masks"]
+        token_masks = prediction.get("token_masks", batch.get("token_pad_mask"))
         batch_size = len(records)
         if pad_masks.shape[0] != batch_size:
             msg = (
@@ -162,6 +195,10 @@ class BoltzWriter(BasePredictionWriter):
 
         # Iterate over the records
         for record_idx, (record, pad_mask) in enumerate(zip(records, pad_masks)):
+            atom_mask = pad_mask.bool()
+            token_mask = (
+                token_masks[record_idx].bool() if token_masks is not None else None
+            )
             start = record_idx * samples_per_record
             end = start + samples_per_record
             coord = coords[start:end]
@@ -197,7 +234,7 @@ class BoltzWriter(BasePredictionWriter):
                 # Get model coord
                 model_coord = coord[model_idx]
                 # Unpad
-                coord_unpad = model_coord[pad_mask.bool()]
+                coord_unpad = model_coord[atom_mask]
                 coord_unpad = coord_unpad.cpu().numpy()
 
                 # New atom table
@@ -250,7 +287,11 @@ class BoltzWriter(BasePredictionWriter):
                 # Get plddt's
                 plddts = None
                 if "plddt" in prediction:
-                    plddts = prediction["plddt"][start + model_idx]
+                    plddts = _unpad_plddt(
+                        prediction["plddt"][start + model_idx],
+                        atom_mask,
+                        token_mask,
+                    )
 
                 # Create path name
                 outname = f"{record.id}_model_{idx_to_rank[model_idx]}"
@@ -328,19 +369,25 @@ class BoltzWriter(BasePredictionWriter):
                     # Save plddt
                     np.savez_compressed(
                         struct_dir / f"plddt_{rank_suffix}.npz",
-                        plddt=prediction["plddt"][start + model_idx].cpu().numpy(),
+                        plddt=plddts.cpu().numpy(),
                     )
 
                 if "pae" in prediction:
+                    pae = _unpad_token_pair(
+                        prediction["pae"][start + model_idx], token_mask
+                    )
                     np.savez_compressed(
                         struct_dir / f"pae_{rank_suffix}.npz",
-                        pae=prediction["pae"][start + model_idx].cpu().numpy(),
+                        pae=pae.cpu().numpy(),
                     )
 
                 if "pde" in prediction:
+                    pde = _unpad_token_pair(
+                        prediction["pde"][start + model_idx], token_mask
+                    )
                     np.savez_compressed(
                         struct_dir / f"pde_{rank_suffix}.npz",
-                        pde=prediction["pde"][start + model_idx].cpu().numpy(),
+                        pde=pde.cpu().numpy(),
                     )
 
             # Save embeddings

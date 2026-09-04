@@ -231,10 +231,13 @@ class TestCheckInputs:
     def test_directory_filters_valid_extensions(self, tmp_path):
         from boltz.main import check_inputs
 
-        (tmp_path / "a.yaml").write_text("y")
+        # Create files out of lexical order to verify filesystem iteration order
+        # cannot change sample ordering (and therefore seeded random streams).
+        (tmp_path / "c.yml").write_text("y")
         (tmp_path / "b.fasta").write_text("f")
-        names = sorted(p.name for p in check_inputs(tmp_path))
-        assert names == ["a.yaml", "b.fasta"]
+        (tmp_path / "a.yaml").write_text("y")
+        names = [p.name for p in check_inputs(tmp_path)]
+        assert names == ["a.yaml", "b.fasta", "c.yml"]
 
     def test_directory_aborts_on_bad_extension_by_default(self, tmp_path):
         from boltz.main import check_inputs

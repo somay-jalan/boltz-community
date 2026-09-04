@@ -23,6 +23,8 @@ from boltz.data.write.writer import (
     BoltzAffinityWriter,
     BoltzWriter,
     _select_prediction_value,
+    _unpad_plddt,
+    _unpad_token_pair,
 )
 
 
@@ -110,6 +112,27 @@ def test_select_prediction_value_serializes_nan_as_null():
     }
 
 
+def test_unpad_prediction_outputs_uses_token_and_atom_masks():
+    token_mask = torch.tensor([True, True, False, False])
+    atom_mask = torch.tensor([True, True, True, False, False])
+    token_plddt = torch.tensor([0.1, 0.2, 9.0, 9.0])
+    atom_plddt = torch.tensor([0.1, 0.2, 0.3, 9.0, 9.0])
+    pair = torch.arange(16).reshape(4, 4)
+
+    assert torch.equal(
+        _unpad_plddt(token_plddt, atom_mask, token_mask),
+        torch.tensor([0.1, 0.2]),
+    )
+    assert torch.equal(
+        _unpad_plddt(atom_plddt, atom_mask, token_mask),
+        torch.tensor([0.1, 0.2, 0.3]),
+    )
+    assert torch.equal(
+        _unpad_token_pair(pair, token_mask),
+        torch.tensor([[0, 1], [4, 5]]),
+    )
+
+
 def test_boltz_writer_splits_batched_predictions_by_record(tmp_path: Path):
     data_dir = tmp_path / "data"
     out_dir = tmp_path / "out"
@@ -138,6 +161,7 @@ def test_boltz_writer_splits_batched_predictions_by_record(tmp_path: Path):
             ]
         ),
         "masks": torch.ones(2, 1, dtype=torch.bool),
+        "token_masks": torch.ones(2, 1, dtype=torch.bool),
         "plddt": torch.tensor([[0.1], [0.2], [0.3], [0.4]]),
         "pae": torch.tensor([[[1.0]], [[2.0]], [[3.0]], [[4.0]]]),
         "pde": torch.tensor([[[10.0]], [[20.0]], [[30.0]], [[40.0]]]),

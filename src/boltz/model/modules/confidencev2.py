@@ -1,6 +1,5 @@
 import torch
 from torch import nn
-from torch.nn.functional import pad
 
 import boltz.model.layers.initialize as init
 from boltz.data import const
@@ -15,6 +14,44 @@ from boltz.model.modules.trunkv2 import (
     ContactConditioning,
 )
 from boltz.model.modules.utils import LinearNoBias
+
+
+def _compute_interface_mask(
+    is_contact,
+    is_different_chain,
+    is_ligand,
+    pad_mask,
+):
+    """Return interface membership without padded entries contributing."""
+    pair_pad_mask = pad_mask.unsqueeze(-1) * pad_mask.unsqueeze(-2)
+    return torch.max(
+        is_contact
+        * is_different_chain
+        * pair_pad_mask
+        * (1 - is_ligand).unsqueeze(-1),
+        dim=-1,
+    ).values
+
+
+def _expand_token_atom_logits(logits, atom_to_token, atom_pad_mask):
+    """Gather fixed-width per-token atom slots into padded atom order."""
+    batch_size, _, max_atoms_per_token, _ = logits.shape
+    token_index = atom_to_token.argmax(dim=-1)
+    atom_slot = (
+        atom_to_token.cumsum(dim=1)
+        .sub(1)
+        .gather(-1, token_index.unsqueeze(-1))
+        .squeeze(-1)
+        .long()
+        .clamp_min(0)
+    )
+    valid_slots = atom_slot[atom_pad_mask.bool()]
+    if valid_slots.numel() and int(valid_slots.max()) >= max_atoms_per_token:
+        msg = "Atom count per token exceeds confidence head capacity."
+        raise ValueError(msg)
+    batch_index = torch.arange(batch_size, device=logits.device).unsqueeze(-1)
+    expanded = logits[batch_index, token_index, atom_slot]
+    return expanded * atom_pad_mask.unsqueeze(-1).to(expanded.dtype)
 
 
 def _stack_confidence_outputs(out_dicts):
@@ -322,7 +359,9 @@ class ConfidenceHeads(nn.Module):
 
         if self.token_level_confidence:
             plddt = compute_aggregated_metric(plddt_logits)
-            token_pad_mask = feats["token_pad_mask"].repeat_interleave(multiplicity, 0)
+            token_pad_mask = (
+                feats["token_pad_mask"].repeat_interleave(multiplicity, 0).float()
+            )
             complex_plddt = (plddt * token_pad_mask).sum(dim=-1) / token_pad_mask.sum(
                 dim=-1
             )
@@ -332,10 +371,12 @@ class ConfidenceHeads(nn.Module):
                 feats["asym_id"].unsqueeze(-1) != feats["asym_id"].unsqueeze(-2)
             ).float()
             is_different_chain = is_different_chain.repeat_interleave(multiplicity, 0)
-            token_interface_mask = torch.max(
-                is_contact * is_different_chain * (1 - is_ligand_token).unsqueeze(-1),
-                dim=-1,
-            ).values
+            token_interface_mask = _compute_interface_mask(
+                is_contact,
+                is_different_chain,
+                is_ligand_token,
+                token_pad_mask,
+            )
             token_non_interface_mask = (1 - token_interface_mask) * (
                 1 - is_ligand_token
             )
@@ -354,53 +395,35 @@ class ConfidenceHeads(nn.Module):
             resolved_logits = resolved_logits.reshape(
                 B, N, self.max_num_atoms_per_token, 2
             )
-
-            arange_max_num_atoms = (
-                torch.arange(self.max_num_atoms_per_token)
-                .reshape(1, 1, -1)
-                .to(resolved_logits.device)
-            )
-            max_num_atoms_mask = (
-                feats["atom_to_token"].sum(1).unsqueeze(-1) > arange_max_num_atoms
-            )
-            resolved_logits = resolved_logits[:, max_num_atoms_mask.squeeze(0)]
-            resolved_logits = pad(
-                resolved_logits,
-                (
-                    0,
-                    0,
-                    0,
-                    int(
-                        feats["atom_pad_mask"].shape[1]
-                        - feats["atom_pad_mask"].sum().item()
-                    ),
-                ),
-                value=0,
-            )
             plddt_logits = plddt_logits.reshape(B, N, self.max_num_atoms_per_token, -1)
-            plddt_logits = plddt_logits[:, max_num_atoms_mask.squeeze(0)]
-            plddt_logits = pad(
-                plddt_logits,
-                (
-                    0,
-                    0,
-                    0,
-                    int(
-                        feats["atom_pad_mask"].shape[1]
-                        - feats["atom_pad_mask"].sum().item()
-                    ),
-                ),
-                value=0,
+            atom_to_token = feats["atom_to_token"].repeat_interleave(
+                multiplicity, 0
             )
-            atom_pad_mask = feats["atom_pad_mask"].repeat_interleave(multiplicity, 0)
+            atom_pad_mask = (
+                feats["atom_pad_mask"].repeat_interleave(multiplicity, 0).float()
+            )
+            resolved_logits = _expand_token_atom_logits(
+                resolved_logits,
+                atom_to_token,
+                atom_pad_mask,
+            )
+            plddt_logits = _expand_token_atom_logits(
+                plddt_logits,
+                atom_to_token,
+                atom_pad_mask,
+            )
             plddt = compute_aggregated_metric(plddt_logits)
 
             complex_plddt = (plddt * atom_pad_mask).sum(dim=-1) / atom_pad_mask.sum(
                 dim=-1
             )
-            token_type = feats["mol_type"].float()
-            atom_to_token = feats["atom_to_token"].float()
-            chain_id_token = feats["asym_id"].float()
+            token_type = feats["mol_type"].repeat_interleave(
+                multiplicity, 0
+            ).float()
+            atom_to_token = atom_to_token.float()
+            chain_id_token = feats["asym_id"].repeat_interleave(
+                multiplicity, 0
+            ).float()
             atom_type = torch.bmm(atom_to_token, token_type.unsqueeze(-1)).squeeze(-1)
             is_ligand_atom = (atom_type == const.chain_type_ids["NONPOLYMER"]).float()
             d_atom = torch.cdist(x_pred, x_pred)
@@ -412,10 +435,12 @@ class ConfidenceHeads(nn.Module):
                 chain_id_atom.unsqueeze(-1) != chain_id_atom.unsqueeze(-2)
             ).float()
 
-            atom_interface_mask = torch.max(
-                is_contact * is_different_chain * (1 - is_ligand_atom).unsqueeze(-1),
-                dim=-1,
-            ).values
+            atom_interface_mask = _compute_interface_mask(
+                is_contact,
+                is_different_chain,
+                is_ligand_atom,
+                atom_pad_mask,
+            )
             atom_non_interface_mask = (1 - atom_interface_mask) * (1 - is_ligand_atom)
             iplddt_weight = (
                 is_ligand_atom * ligand_weight
@@ -423,9 +448,9 @@ class ConfidenceHeads(nn.Module):
                 + atom_non_interface_mask * non_interface_weight
             )
 
-            complex_iplddt = (plddt * feats["atom_pad_mask"] * iplddt_weight).sum(
+            complex_iplddt = (plddt * atom_pad_mask * iplddt_weight).sum(
                 dim=-1
-            ) / torch.sum(feats["atom_pad_mask"] * iplddt_weight, dim=-1)
+            ) / torch.sum(atom_pad_mask * iplddt_weight, dim=-1)
 
         # Compute the gPDE and giPDE
         pde = compute_aggregated_metric(pde_logits, end=32)

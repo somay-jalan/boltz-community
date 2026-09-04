@@ -407,7 +407,9 @@ def check_inputs(data: Path, skip_bad_inputs: bool = False) -> list[Path]:
 
     # Check if data is a directory
     if data.is_dir():
-        data: list[Path] = list(data.glob("*"))
+        # Filesystem directory iteration order is not stable. Keep input order
+        # deterministic so seeded random streams are assigned to the same samples.
+        data: list[Path] = sorted(data.glob("*"))
 
         # Filter out non .fasta or .yaml files
         valid = []
@@ -986,7 +988,10 @@ def process_inputs(
     records_dir = out_dir / "processed" / "records"
     if records_dir.exists():
         # Load existing records
-        existing = [Record.load(p) for p in records_dir.glob("*.json")]
+        existing = sorted(
+            (Record.load(p) for p in records_dir.glob("*.json")),
+            key=lambda record: record.id,
+        )
         processed_ids = {record.id for record in existing}
 
         # Filter to missing only
@@ -1073,7 +1078,10 @@ def process_inputs(
             click.echo(f"  {msg}")
 
     # Load all records and write manifest
-    records = [Record.load(p) for p in records_dir.glob("*.json")]
+    records = sorted(
+        (Record.load(p) for p in records_dir.glob("*.json")),
+        key=lambda record: record.id,
+    )
     manifest = Manifest(records)
     manifest.dump(out_dir / "processed" / "manifest.json")
 
