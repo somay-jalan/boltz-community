@@ -607,23 +607,29 @@ class Boltz2(LightningModule):
             )
 
         if self.affinity_prediction:
-            pad_token_mask = feats["token_pad_mask"][0]
-            rec_mask = feats["mol_type"][0] == 0
+            batch_size = feats["token_pad_mask"].shape[0]
+            pad_token_mask = feats["token_pad_mask"]
+            rec_mask = feats["mol_type"] == 0
             rec_mask = rec_mask * pad_token_mask
-            lig_mask = feats["affinity_token_mask"][0].to(torch.bool)
+            lig_mask = feats["affinity_token_mask"].to(torch.bool)
             lig_mask = lig_mask * pad_token_mask
             cross_pair_mask = (
-                lig_mask[:, None] * rec_mask[None, :]
-                + rec_mask[:, None] * lig_mask[None, :]
-                + lig_mask[:, None] * lig_mask[None, :]
+                lig_mask[:, :, None] * rec_mask[:, None, :]
+                + rec_mask[:, :, None] * lig_mask[:, None, :]
+                + lig_mask[:, :, None] * lig_mask[:, None, :]
             )
-            z_affinity = z * cross_pair_mask[None, :, :, None]
+            z_affinity = z * cross_pair_mask[:, :, :, None]
 
-            argsort = torch.argsort(dict_out["iptm"], descending=True)
-            best_idx = argsort[0].item()
-            coords_affinity = dict_out["sample_atom_coords"].detach()[best_idx][
-                None, None
-            ]
+            iptm = dict_out["iptm"].reshape(batch_size, diffusion_samples)
+            best_idx = torch.argmax(iptm, dim=1)
+            sample_atom_coords = dict_out["sample_atom_coords"].detach().reshape(
+                batch_size,
+                diffusion_samples,
+                *dict_out["sample_atom_coords"].shape[1:],
+            )
+            coords_affinity = sample_atom_coords[
+                torch.arange(batch_size, device=best_idx.device), best_idx
+            ].unsqueeze(1)
             s_inputs = self.input_embedder(feats, affinity=True)
 
             with torch.autocast(autocast_device_type(s.device.type), enabled=False):
@@ -689,7 +695,15 @@ class Boltz2(LightningModule):
                         model_coef = 1.03525938
                         mw_coef = -0.59992683
                         bias = 2.83288489
-                        mw = feats["affinity_mw"][0] ** 0.3
+                        mw = torch.as_tensor(feats["affinity_mw"]).to(
+                            device=dict_out_affinity_ensemble[
+                                "affinity_pred_value"
+                            ].device,
+                            dtype=dict_out_affinity_ensemble[
+                                "affinity_pred_value"
+                            ].dtype,
+                        )
+                        mw = mw.reshape(batch_size, 1) ** 0.3
                         dict_out_affinity_ensemble["affinity_pred_value"] = (
                             model_coef
                             * dict_out_affinity_ensemble["affinity_pred_value"]

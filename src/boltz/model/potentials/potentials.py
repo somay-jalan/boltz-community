@@ -597,6 +597,93 @@ class PlanarBondPotential(FlatBottomPotential, AbsDihedralPotential):
 
 
 class TemplateReferencePotential(FlatBottomPotential, ReferencePotential):
+    def compute_gradient(self, coords, feats, parameters):
+        """Compute forced-template gradients for every record in a batch."""
+        if feats["atom_pad_mask"].shape[0] == 1:
+            return super().compute_gradient(coords, feats, parameters)
+        if "template_force" not in feats:
+            return torch.zeros_like(coords)
+
+        batch_size = feats["atom_pad_mask"].shape[0]
+        if coords.shape[0] % batch_size != 0:
+            msg = "Coordinate rows must be divisible by the feature batch size."
+            raise ValueError(msg)
+        multiplicity = coords.shape[0] // batch_size
+        num_atoms = coords.shape[-2]
+        num_tokens = feats["token_to_rep_atom"].shape[1]
+        num_templates = feats["template_cb"].shape[1]
+
+        force = feats["template_force"].bool()
+        template_mask = feats["template_mask_cb"].bool()
+        active_template = force & template_mask.any(dim=-1)
+        if not active_template.any():
+            return torch.zeros_like(coords)
+
+        coords_by_record = coords.reshape(batch_size, multiplicity, num_atoms, 3)
+        atom_indices = torch.arange(num_atoms, device=coords.device)
+        rep_atom_index = (
+            feats["token_to_rep_atom"].float() * atom_indices[None, None]
+        ).sum(dim=-1).long()
+        query_coords = torch.gather(
+            coords_by_record,
+            2,
+            rep_atom_index[:, None, :, None].expand(
+                batch_size, multiplicity, num_tokens, 3
+            ),
+        )
+
+        query_expanded = query_coords[:, :, None].expand(
+            batch_size, multiplicity, num_templates, num_tokens, 3
+        )
+        ref_expanded = feats["template_cb"][:, None].expand_as(query_expanded)
+        mask_expanded = template_mask[:, None].expand(
+            batch_size, multiplicity, num_templates, num_tokens
+        )
+        active = active_template[:, None].expand(
+            batch_size, multiplicity, num_templates
+        )
+
+        query_active = query_expanded[active]
+        ref_active = ref_expanded[active]
+        mask_active = mask_expanded[active]
+        aligned_ref = weighted_rigid_align(
+            ref_active.float(),
+            query_active.float(),
+            mask_active.float(),
+            mask_active.float(),
+        ).to(query_active)
+
+        displacement = query_active - aligned_ref
+        distance = torch.linalg.norm(displacement, dim=-1)
+        direction = displacement / distance.clamp_min(1e-8).unsqueeze(-1)
+        thresholds = feats["template_force_threshold"][:, None].expand(
+            batch_size, multiplicity, num_templates
+        )[active]
+        derivative = (
+            (distance > thresholds[:, None]) & mask_active
+        ).to(direction.dtype)
+        active_gradient = direction * derivative.unsqueeze(-1)
+
+        token_gradient = torch.zeros_like(query_expanded)
+        token_gradient[active] = active_gradient
+        token_gradient = token_gradient.sum(dim=2)
+
+        token_index = (
+            feats["atom_to_token"].float()
+            * feats["token_index"][:, None].float()
+        ).sum(dim=-1).long()
+        atom_gradient = torch.gather(
+            token_gradient,
+            2,
+            token_index[:, None, :, None].expand(
+                batch_size, multiplicity, num_atoms, 3
+            ),
+        )
+        atom_gradient = atom_gradient * feats["atom_pad_mask"][
+            :, None, :, None
+        ].to(atom_gradient)
+        return atom_gradient.reshape_as(coords)
+
     def compute_args(self, feats, parameters):
         if "template_mask_cb" not in feats or "template_force" not in feats:
             return torch.empty([1, 0]), None, None, None, None
@@ -651,6 +738,95 @@ class TemplateReferencePotential(FlatBottomPotential, ReferencePotential):
 
 
 class ContactPotentital(FlatBottomPotential, DistancePotential):
+    def compute_gradient(self, coords, feats, parameters):
+        """Compute masked contact gradients for every record in a batch."""
+        if feats["atom_pad_mask"].shape[0] == 1:
+            return super().compute_gradient(coords, feats, parameters)
+
+        batch_size = feats["atom_pad_mask"].shape[0]
+        if coords.shape[0] % batch_size != 0:
+            msg = "Coordinate rows must be divisible by the feature batch size."
+            raise ValueError(msg)
+        multiplicity = coords.shape[0] // batch_size
+        num_atoms = coords.shape[-2]
+        pair_index = feats["contact_pair_index"].long()
+        num_pairs = pair_index.shape[-1]
+        if num_pairs == 0:
+            return torch.zeros_like(coords)
+
+        valid = feats.get(
+            "contact_constraint_mask", feats["contact_thresholds"] > 0
+        ).bool()
+        if not valid.any():
+            return torch.zeros_like(coords)
+
+        coords_by_record = coords.reshape(batch_size, multiplicity, num_atoms, 3)
+        gather_i = pair_index[:, 0, None, :, None].expand(
+            batch_size, multiplicity, num_pairs, 3
+        )
+        gather_j = pair_index[:, 1, None, :, None].expand_as(gather_i)
+        coords_i = torch.gather(coords_by_record, 2, gather_i)
+        coords_j = torch.gather(coords_by_record, 2, gather_j)
+        displacement = coords_i - coords_j
+        distance = torch.linalg.norm(displacement, dim=-1)
+        direction = displacement / distance.clamp_min(1e-8).unsqueeze(-1)
+
+        threshold = feats["contact_thresholds"][:, None]
+        normal_contact = feats["contact_negation_mask"][:, None].bool()
+        valid_expanded = valid[:, None].expand_as(distance)
+        derivative = torch.zeros_like(distance)
+        derivative[
+            valid_expanded & normal_contact & (distance > threshold)
+        ] = 1
+        derivative[
+            valid_expanded & ~normal_contact & (distance < threshold)
+        ] = -1
+        energy = torch.zeros_like(distance)
+        energy[valid_expanded & normal_contact] = torch.relu(
+            distance - threshold
+        )[valid_expanded & normal_contact]
+        energy[valid_expanded & ~normal_contact] = torch.relu(
+            threshold - distance
+        )[valid_expanded & ~normal_contact]
+
+        union_index = feats["contact_union_index"].long()
+        num_unions = int(union_index[valid].max().item()) + 1
+        union_expanded = union_index[:, None].expand(
+            batch_size, multiplicity, num_pairs
+        )
+        neg_exp_energy = (
+            torch.exp(-parameters["union_lambda"] * energy)
+            * valid_expanded.to(energy)
+        )
+        partition = torch.zeros(
+            (batch_size, multiplicity, num_unions),
+            device=coords.device,
+            dtype=coords.dtype,
+        )
+        partition.scatter_add_(2, union_expanded, neg_exp_energy)
+        pair_partition = torch.gather(partition, 2, union_expanded)
+        softmax = torch.where(
+            valid_expanded & (pair_partition > 0),
+            neg_exp_energy / pair_partition.clamp_min(1e-8),
+            0,
+        )
+        union_energy = torch.zeros_like(partition)
+        union_energy.scatter_add_(2, union_expanded, energy * softmax)
+        mean_energy = torch.gather(union_energy, 2, union_expanded)
+        derivative = derivative * softmax * (
+            1
+            + parameters["union_lambda"] * (energy - mean_energy)
+        )
+
+        pair_gradient = derivative.unsqueeze(-1) * direction
+        atom_gradient = torch.zeros_like(coords_by_record)
+        atom_gradient.scatter_add_(2, gather_i, pair_gradient)
+        atom_gradient.scatter_add_(2, gather_j, -pair_gradient)
+        atom_gradient = atom_gradient * feats["atom_pad_mask"][
+            :, None, :, None
+        ].to(atom_gradient)
+        return atom_gradient.reshape_as(coords)
+
     def compute_args(self, feats, parameters):
         index = feats["contact_pair_index"][0]
         union_index = feats["contact_union_index"][0]

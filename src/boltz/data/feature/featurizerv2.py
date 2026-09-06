@@ -1492,11 +1492,18 @@ def process_atom_features(
         coords = override_coords.unsqueeze(0)
 
     # Apply random roto-translation to the input conformers
+    augmentation_generator = torch.Generator(device=ref_pos.device)
+    augmentation_generator.manual_seed(
+        int(random.integers(0, np.iinfo(np.int64).max))
+    )
     for i in range(torch.max(ref_space_uid)):
         included = ref_space_uid == i
         if torch.sum(included) > 0 and torch.any(resolved_mask[included]):
             ref_pos[included] = center_random_augmentation(
-                ref_pos[included][None], resolved_mask[included][None], centering=True
+                ref_pos[included][None],
+                resolved_mask[included][None],
+                centering=True,
+                generator=augmentation_generator,
             )[0]
 
     # Compute padding and apply
@@ -1690,6 +1697,10 @@ def load_dummy_templates_features(tdim: int, num_tokens: int) -> dict:
         "template_mask": torch.from_numpy(template_mask),
         "query_to_template": torch.from_numpy(query_to_template),
         "visibility_ids": torch.from_numpy(visibility_ids),
+        "template_force": torch.zeros(tdim, dtype=torch.bool),
+        "template_force_threshold": torch.full(
+            (tdim,), float("inf"), dtype=torch.float32
+        ),
     }
 
 
@@ -2154,6 +2165,7 @@ def process_contact_feature_constraints(
         "contact_union_index": union_index,
         "contact_negation_mask": negation_mask,
         "contact_thresholds": thresholds,
+        "contact_constraint_mask": torch.ones_like(thresholds, dtype=torch.bool),
     }
 
 

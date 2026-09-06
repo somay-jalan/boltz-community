@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from math import sqrt
 
 import numpy as np
@@ -301,11 +302,42 @@ class AtomDiffusion(Module):
         steering_args=None,
         **network_condition_kwargs,
     ):
-        if steering_args is not None and (
+        batch_size = atom_mask.shape[0]
+        base_atom_mask = atom_mask
+        record_generators = []
+        for record in network_condition_kwargs["feats"]["record"]:
+            record_seed = int.from_bytes(
+                hashlib.blake2b(record.id.encode(), digest_size=8).digest(),
+                byteorder="little",
+            )
+            seed = (torch.initial_seed() + record_seed) % (2**63 - 1)
+            generator = torch.Generator(device=atom_mask.device)
+            generator.manual_seed(seed)
+            record_generators.append(generator)
+
+        def per_record_atom_noise(dtype):
+            record_noise = []
+            max_atoms = base_atom_mask.shape[1]
+            for record_idx, generator in enumerate(record_generators):
+                valid_atoms = int(base_atom_mask[record_idx].sum().item())
+                samples = []
+                for _ in range(multiplicity):
+                    noise = torch.randn(
+                        (valid_atoms, 3),
+                        dtype=dtype,
+                        device=base_atom_mask.device,
+                        generator=generator,
+                    )
+                    samples.append(F.pad(noise, (0, 0, 0, max_atoms - valid_atoms)))
+                record_noise.append(torch.stack(samples))
+            return torch.cat(record_noise, dim=0)
+
+        guided = steering_args is not None and (
             steering_args["fk_steering"]
             or steering_args["physical_guidance_update"]
             or steering_args["contact_guidance_update"]
-        ):
+        )
+        if guided:
             potentials = get_potentials(steering_args, boltz2=True)
 
         if steering_args["fk_steering"]:
@@ -319,17 +351,19 @@ class AtomDiffusion(Module):
             or steering_args["contact_guidance_update"]
         ):
             scaled_guidance_update = torch.zeros(
-                (multiplicity, *atom_mask.shape[1:], 3),
+                (batch_size * multiplicity, *atom_mask.shape[1:], 3),
                 dtype=torch.float32,
                 device=self.device,
             )
         if max_parallel_samples is None:
-            max_parallel_samples = multiplicity
+            max_parallel_samples = batch_size * multiplicity
+        if max_parallel_samples < 1:
+            msg = "max_parallel_samples must be at least 1"
+            raise ValueError(msg)
 
         num_sampling_steps = default(num_sampling_steps, self.num_sampling_steps)
         atom_mask = atom_mask.repeat_interleave(multiplicity, 0)
-
-        shape = (*atom_mask.shape, 3)
+        coord_mask = atom_mask.to(dtype=torch.float32).unsqueeze(-1)
 
         # get the schedule, which is returned as (sigma, gamma) tuple, and pair up with the next sigma and gamma
         sigmas = self.sample_schedule(num_sampling_steps)
@@ -342,25 +376,44 @@ class AtomDiffusion(Module):
 
         # atom position is noise at the beginning
         init_sigma = sigmas[0]
-        atom_coords = init_sigma * torch.randn(shape, device=self.device)
+        atom_coords = init_sigma * per_record_atom_noise(torch.float32)
+        atom_coords = atom_coords * coord_mask.to(atom_coords)
         token_repr = None
         atom_coords_denoised = None
 
         # gradually denoise
         for step_idx, (sigma_tm, sigma_t, gamma) in enumerate(sigmas_and_gammas):
-            random_R, random_tr = compute_random_augmentation(
-                multiplicity, device=atom_coords.device, dtype=atom_coords.dtype
+            augmentations = [
+                compute_random_augmentation(
+                    multiplicity,
+                    device=atom_coords.device,
+                    dtype=atom_coords.dtype,
+                    generator=generator,
+                )
+                for generator in record_generators
+            ]
+            random_R = torch.cat([value[0] for value in augmentations])
+            random_tr = torch.cat([value[1] for value in augmentations])
+            center = (atom_coords * coord_mask).sum(dim=-2, keepdim=True) / (
+                coord_mask.sum(dim=-2, keepdim=True) + 1e-8
             )
-            atom_coords = atom_coords - atom_coords.mean(dim=-2, keepdims=True)
+            atom_coords = (atom_coords - center) * coord_mask
             atom_coords = (
                 torch.einsum("bmd,bds->bms", atom_coords, random_R) + random_tr
-            )
+            ) * coord_mask
             if atom_coords_denoised is not None:
-                atom_coords_denoised -= atom_coords_denoised.mean(dim=-2, keepdims=True)
+                denoised_center = (
+                    atom_coords_denoised * coord_mask
+                ).sum(dim=-2, keepdim=True) / (
+                    coord_mask.sum(dim=-2, keepdim=True) + 1e-8
+                )
+                atom_coords_denoised = (
+                    atom_coords_denoised - denoised_center
+                ) * coord_mask
                 atom_coords_denoised = (
                     torch.einsum("bmd,bds->bms", atom_coords_denoised, random_R)
                     + random_tr
-                )
+                ) * coord_mask
             if (
                 steering_args["physical_guidance_update"]
                 or steering_args["contact_guidance_update"]
@@ -374,26 +427,52 @@ class AtomDiffusion(Module):
             t_hat = sigma_tm * (1 + gamma)
             steering_t = 1.0 - (step_idx / num_sampling_steps)
             noise_var = self.noise_scale**2 * (t_hat**2 - sigma_tm**2)
-            eps = sqrt(noise_var) * torch.randn(shape, device=self.device)
+            eps = (
+                sqrt(noise_var)
+                * per_record_atom_noise(atom_coords.dtype)
+                * coord_mask
+            )
             atom_coords_noisy = atom_coords + eps
 
             with torch.no_grad():
                 atom_coords_denoised = torch.zeros_like(atom_coords_noisy)
-                sample_ids = torch.arange(multiplicity, device=atom_coords_noisy.device)
-                sample_ids_chunks = sample_ids.chunk(
-                    multiplicity % max_parallel_samples + 1
+                # Coordinates are record-major: [record, diffusion sample].
+                # Limit the total number of coordinates in a network call, while
+                # keeping the same sample offsets for every record so the repeated
+                # conditioning tensors remain aligned with the coordinate tensors.
+                samples_per_chunk = max(
+                    1,
+                    min(max_parallel_samples // batch_size, multiplicity),
                 )
+                sample_ids_chunks = []
+                for start in range(0, multiplicity, samples_per_chunk):
+                    stop = min(start + samples_per_chunk, multiplicity)
+                    sample_ids_chunks.append(
+                        torch.cat(
+                            [
+                                torch.arange(
+                                    record_idx * multiplicity + start,
+                                    record_idx * multiplicity + stop,
+                                    device=atom_coords_noisy.device,
+                                )
+                                for record_idx in range(batch_size)
+                            ]
+                        )
+                    )
 
                 for sample_ids_chunk in sample_ids_chunks:
+                    chunk_multiplicity = sample_ids_chunk.numel() // batch_size
                     atom_coords_denoised_chunk = self.preconditioned_network_forward(
                         atom_coords_noisy[sample_ids_chunk],
                         t_hat,
                         network_condition_kwargs=dict(
-                            multiplicity=sample_ids_chunk.numel(),
+                            multiplicity=chunk_multiplicity,
                             **network_condition_kwargs,
                         ),
                     )
-                    atom_coords_denoised[sample_ids_chunk] = atom_coords_denoised_chunk
+                    atom_coords_denoised[sample_ids_chunk] = (
+                        atom_coords_denoised_chunk * coord_mask[sample_ids_chunk]
+                    )
 
                 if steering_args["fk_steering"] and (
                     (
@@ -526,6 +605,7 @@ class AtomDiffusion(Module):
             )
 
             atom_coords = atom_coords_next
+            atom_coords = atom_coords * coord_mask
 
         return dict(sample_atom_coords=atom_coords, diff_token_repr=token_repr)
 

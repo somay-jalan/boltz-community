@@ -911,6 +911,31 @@ def cli() -> None:
     default=2,
 )
 @click.option(
+    "--batch_size",
+    type=click.IntRange(min=1),
+    help=(
+        "The number of inputs to process together during Boltz-2 structure "
+        "and affinity prediction. Default is 1."
+    ),
+    default=1,
+)
+@click.option(
+    "--contact_guidance/--no_contact_guidance",
+    default=True,
+    help=(
+        "Enable contact and forced-template guidance during structure diffusion. "
+        "Default is enabled."
+    ),
+)
+@click.option(
+    "--full_precision",
+    is_flag=True,
+    help=(
+        "Run Boltz-2 inference in FP32 instead of mixed bfloat16 precision. "
+        "This is primarily useful for numerical diagnostics."
+    ),
+)
+@click.option(
     "--override",
     is_flag=True,
     help="Whether to override existing found predictions. Default is False.",
@@ -1007,6 +1032,15 @@ def cli() -> None:
     default=5,
 )
 @click.option(
+    "--max_parallel_samples_affinity",
+    type=click.IntRange(min=1),
+    help=(
+        "The maximum total number of affinity diffusion samples to process "
+        "in one network call across the inference batch. Default is 8."
+    ),
+    default=8,
+)
+@click.option(
     "--affinity_checkpoint",
     type=click.Path(exists=True),
     help="An optional checkpoint, will use the provided Boltz-1 model by default.",
@@ -1051,13 +1085,17 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     sampling_steps: int = 200,
     diffusion_samples: int = 1,
     sampling_steps_affinity: int = 200,
-    diffusion_samples_affinity: int = 3,
+    diffusion_samples_affinity: int = 5,
+    max_parallel_samples_affinity: int = 8,
     max_parallel_samples: Optional[int] = None,
     step_scale: Optional[float] = None,
     write_full_pae: bool = False,
     write_full_pde: bool = False,
     output_format: Literal["pdb", "mmcif"] = "mmcif",
     num_workers: int = 2,
+    batch_size: int = 1,
+    contact_guidance: bool = True,
+    full_precision: bool = False,
     override: bool = False,
     seed: Optional[int] = None,
     use_msa_server: bool = False,
@@ -1083,6 +1121,13 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     if accelerator == "cpu":
         msg = "Running on CPU, this will be slow. Consider using a GPU."
         click.echo(msg)
+
+    if batch_size > 1 and model != "boltz2":
+        raise click.UsageError("Batched inference is only supported for Boltz-2.")
+    if batch_size > 1 and use_potentials:
+        raise click.UsageError(
+            "Physical/FK potentials are not supported with batch_size greater than 1."
+        )
 
     # Supress some lightning warnings
     warnings.filterwarnings(
@@ -1259,7 +1304,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
         callbacks=[pred_writer],
         accelerator=accelerator,
         devices=devices,
-        precision=32 if model == "boltz1" else "bf16-mixed",
+        precision=32 if model == "boltz1" or full_precision else "bf16-mixed",
     )
 
     if filtered_manifest.records:
@@ -1275,6 +1320,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
                 msa_dir=processed.msa_dir,
                 mol_dir=mol_dir,
                 num_workers=num_workers,
+                batch_size=batch_size,
                 constraints_dir=processed.constraints_dir,
                 template_dir=processed.template_dir,
                 extra_mols_dir=processed.extra_mols_dir,
@@ -1309,6 +1355,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
         steering_args = BoltzSteeringParams()
         steering_args.fk_steering = use_potentials
         steering_args.physical_guidance_update = use_potentials
+        steering_args.contact_guidance_update = contact_guidance
 
         model_cls = Boltz2 if model == "boltz2" else Boltz1
         model_module = model_cls.load_from_checkpoint(
@@ -1362,6 +1409,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
             msa_dir=processed.msa_dir,
             mol_dir=mol_dir,
             num_workers=num_workers,
+            batch_size=batch_size,
             constraints_dir=processed.constraints_dir,
             template_dir=processed.template_dir,
             extra_mols_dir=processed.extra_mols_dir,
@@ -1373,7 +1421,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
             "recycling_steps": 5,
             "sampling_steps": sampling_steps_affinity,
             "diffusion_samples": diffusion_samples_affinity,
-            "max_parallel_samples": 1,
+            "max_parallel_samples": max_parallel_samples_affinity,
             "write_confidence_summary": False,
             "write_full_pae": False,
             "write_full_pde": False,
@@ -1395,6 +1443,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
             map_location="cpu",
             diffusion_process_args=asdict(diffusion_params),
             ema=False,
+            use_kernels=not no_kernels,
             pairformer_args=asdict(pairformer_args),
             msa_args=asdict(msa_args),
             steering_args=asdict(steering_args),

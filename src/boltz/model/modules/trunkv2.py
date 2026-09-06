@@ -1,3 +1,5 @@
+import hashlib
+
 import torch
 from torch import Tensor, nn
 from torch.nn.functional import one_hot
@@ -544,6 +546,7 @@ class MSAModule(nn.Module):
         self.activation_checkpointing = activation_checkpointing
         self.subsample_msa = subsample_msa
         self.num_subsampled_msa = num_subsampled_msa
+        self._inference_msa_calls: dict[str, int] = {}
 
         self.s_proj = nn.Linear(token_s, msa_s, bias=False)
         self.msa_proj = nn.Linear(
@@ -629,9 +632,55 @@ class MSAModule(nn.Module):
 
         # Subsample the MSA
         if self.subsample_msa:
-            msa_indices = torch.randperm(msa.shape[1])[: self.num_subsampled_msa]
-            m = m[:, msa_indices]
-            msa_mask = msa_mask[:, msa_indices]
+            # Select rows independently for each record and never sample padded
+            # MSA rows. A single shared permutation would couple records and can
+            # replace real rows with padding in heterogeneous batches.
+            selected_m = []
+            selected_masks = []
+            selected_counts = []
+            for batch_idx in range(m.shape[0]):
+                valid_indices = torch.nonzero(
+                    msa_mask[batch_idx].bool().any(dim=-1), as_tuple=False
+                ).squeeze(-1)
+                count = min(valid_indices.numel(), self.num_subsampled_msa)
+                generator = None
+                if not self.training and "record" in feats:
+                    record_id = feats["record"][batch_idx].id
+                    occurrence = self._inference_msa_calls.get(record_id, 0)
+                    self._inference_msa_calls[record_id] = occurrence + 1
+                    record_seed = int.from_bytes(
+                        hashlib.blake2b(
+                            record_id.encode(), digest_size=8
+                        ).digest(),
+                        byteorder="little",
+                    )
+                    seed = (torch.initial_seed() + record_seed + occurrence) % (
+                        2**63 - 1
+                    )
+                    generator = torch.Generator(device=valid_indices.device)
+                    generator.manual_seed(seed)
+                permutation = torch.randperm(
+                    valid_indices.numel(),
+                    device=valid_indices.device,
+                    generator=generator,
+                )[:count]
+                indices = valid_indices[permutation]
+                selected_m.append(m[batch_idx, indices])
+                selected_masks.append(msa_mask[batch_idx, indices])
+                selected_counts.append(count)
+
+            max_selected = max(selected_counts)
+            m_subsampled = m.new_zeros(
+                m.shape[0], max_selected, *m.shape[2:]
+            )
+            mask_subsampled = msa_mask.new_zeros(
+                msa_mask.shape[0], max_selected, *msa_mask.shape[2:]
+            )
+            for batch_idx, count in enumerate(selected_counts):
+                m_subsampled[batch_idx, :count] = selected_m[batch_idx]
+                mask_subsampled[batch_idx, :count] = selected_masks[batch_idx]
+            m = m_subsampled
+            msa_mask = mask_subsampled
 
         # Compute input projections
         m = self.msa_proj(m)
